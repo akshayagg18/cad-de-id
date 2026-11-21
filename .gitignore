@@ -1,0 +1,13 @@
+# NEVER commit source data, private mappings, credentials or run output
+input/
+out/
+private/
+attempt-*/
+*.tsv
+*.token
+.env
+*.env
+token*
+__pycache__/
+.pytest_cache/
+*.pyc

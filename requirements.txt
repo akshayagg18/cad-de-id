@@ -1,0 +1,6 @@
+# Runtime dependencies of the CAD De-ID pipeline (Python >= 3.10, Linux, case-sensitive filesystem).
+# Everything else is the standard library.
+olefile==0.47
+pikepdf==10.16.0
+# tests only
+pytest>=8
