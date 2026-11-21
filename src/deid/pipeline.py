@@ -136,16 +136,70 @@ def sweep_tmp(output_dir):
     return n
 
 
+def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) -> tuple[set, int]:
+    """Decide which recorded rows can be trusted on --resume.
+
+    A row counts as done only if its output file still exists (and, for byte-identical files, still has the
+    recorded size) and it did not end in ERROR. Every other row is dropped from path_map.tsv (rewritten
+    atomically) together with the defect lines that belong to it, so the file is processed again and no
+    duplicate rows can appear. Returns (done input paths, number of dropped rows).
+    """
+    kept: list[str] = []
+    done: set = set()
+    dropped_outs: set = set()
+    dropped = 0
+    with open(map_path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 4:                                   # torn last line of a crashed run
+                dropped += 1
+                continue
+            rel, rel_out, action, size = parts
+            p = os.path.join(output_dir, rel_out)
+            ok = rel in rels and rel not in done and action != "ERROR" and os.path.isfile(p) and not os.path.islink(p)
+            if ok and action == "unchanged":
+                try:
+                    ok = os.path.getsize(p) == int(size)
+                except (OSError, ValueError):
+                    ok = False
+            if ok:
+                kept.append(line if line.endswith("\n") else line + "\n")
+                done.add(rel)
+            else:
+                dropped += 1
+                dropped_outs.add(rel_out)
+    tmp = map_path + TMP_SUFFIX
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    os.replace(tmp, map_path)
+    if os.path.exists(defects_path):                              # forget defects of rows that will be redone
+        seen, keep_d = set(), []
+        with open(defects_path, encoding="utf-8") as f:
+            for line in f:
+                where = line.split("\t", 1)[0].partition("!")[0]
+                if where in dropped_outs or line in seen:
+                    continue
+                seen.add(line)
+                keep_d.append(line if line.endswith("\n") else line + "\n")
+        tmp = defects_path + TMP_SUFFIX
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(keep_d)
+        os.replace(tmp, defects_path)
+    return done, dropped
+
+
 def run_transform(input_dir, output_dir, private, jobs, link=True, rename_owners=True, resume=False, rename_paths=True):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(private, exist_ok=True)
     rels = walk_inputs(input_dir)
     done = set()
     map_path = os.path.join(private, "path_map.tsv")
+    defects_path = os.path.join(private, "defects.tsv")
     if resume and os.path.exists(map_path):
-        with open(map_path, encoding="utf-8") as f:
-            for line in f:
-                done.add(line.split("\t", 1)[0])
+        done, dropped = _resume_state(map_path, defects_path, output_dir, set(rels))
+        if dropped:
+            print(f"[transform] resume: {dropped} recorded rows had a missing/changed output or failed earlier "
+                  f"and will be processed again", flush=True)
     todo = [r for r in rels if r not in done]
     print(f"[transform] {len(rels)} inputs, {len(done)} already done, {len(todo)} to do", flush=True)
     stats = collections.Counter()
@@ -260,8 +314,9 @@ def _v_one(args):
     return rel_out, leaks, "ok"
 
 
-def run_verify(input_dir, output_dir, private, jobs) -> dict:
-    rep: dict = {"checks": {}}
+def run_verify(input_dir, output_dir, private, jobs, expected_files: int | None = None) -> dict:
+    rep: dict = {"checks": {}, "output_dir": os.path.realpath(output_dir),
+                 "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     ins = set(walk_inputs(input_dir))
     outs = set(walk_inputs(output_dir))
     rows = []
@@ -272,6 +327,11 @@ def run_verify(input_dir, output_dir, private, jobs) -> dict:
     mapped_in = {r[0] for r in rows}
     out_names = [r[1] for r in rows]
     rep["inputs"], rep["outputs"], rep["mapped"] = len(ins), len(outs), len(mapped_in)
+    if expected_files is not None:
+        rep["expected_files"] = expected_files
+        rep["checks"]["input_count_is_expected"] = len(ins) == expected_files
+        rep["checks"]["output_count_is_expected"] = len(outs) == expected_files
+    rep["checks"]["no_failed_files"] = not any(r[2] == "ERROR" for r in rows)
     rep["checks"]["every_input_mapped"] = ins == mapped_in
     rep["checks"]["output_count_equals_input"] = len(outs) == len(ins)
     rep["checks"]["no_output_name_collisions"] = len(set(out_names)) == len(out_names)
@@ -288,8 +348,13 @@ def run_verify(input_dir, output_dir, private, jobs) -> dict:
     zero_out = sum(1 for r in rows if os.path.exists(os.path.join(output_dir, r[1])) and os.path.getsize(os.path.join(output_dir, r[1])) == 0)
     rep["checks"]["empty_files_preserved"] = zero_in == zero_out
     rep["action_counts"] = dict(collections.Counter(r[2] for r in rows))
-    # leak scan
-    leaks_total, unreadable, leak_files = 0, 0, []
+    # leak scan. A file whose identity-bearing zones cannot be parsed was NOT scanned. If the pipeline recorded a defect
+    # for it (corrupt source, unsupported container, ...) it is a known source defect and only counted. Without a defect
+    # record it is unexplained: for a REWRITTEN output that is new corruption (hard failure), for a byte-identical file
+    # it is a warning that something went unscanned. Nothing is silently ignored.
+    leaks_total, leak_files = 0, []
+    unreadable = []
+    action_of = {r[1]: r[2] for r in rows}
     tasks = [(r[1], os.path.join(output_dir, r[1])) for r in rows]
     with mp.Pool(jobs, initializer=_v_init, initargs=(private,)) as pool:
         for rel_out, leaks, status in pool.imap_unordered(_v_one, tasks, chunksize=32):
@@ -297,14 +362,124 @@ def run_verify(input_dir, output_dir, private, jobs) -> dict:
                 leaks_total += leaks
                 leak_files.append(rel_out)
             if status != "ok":
-                unreadable += 1
+                unreadable.append(rel_out)
+    recorded = set()
+    dpath = os.path.join(private, "defects.tsv")
+    if os.path.exists(dpath):
+        with open(dpath, encoding="utf-8") as f:
+            for line in f:
+                recorded.add(line.split("\t", 1)[0].partition("!")[0])
+    known = sorted(x for x in unreadable if x in recorded)
+    bad_rewritten = sorted(x for x in unreadable if x not in recorded and action_of.get(x) == "rewritten")
+    bad_unchanged = sorted(x for x in unreadable if x not in recorded and action_of.get(x) != "rewritten")
     rep["leak_scan"] = {"phrase_hits_in_output": leaks_total, "files_with_hits": len(leak_files),
-                        "sample_files": leak_files[:20], "unreadable_views": unreadable}
+                        "sample_files": sorted(leak_files)[:20],
+                        "unreadable_views": len(unreadable),
+                        "unreadable_known_source_defects": len(known),
+                        "unreadable_rewritten_unexplained": len(bad_rewritten),
+                        "unreadable_rewritten_unexplained_sample": bad_rewritten[:20],
+                        "unreadable_unchanged_unexplained": len(bad_unchanged),
+                        "unreadable_unchanged_unexplained_sample": bad_unchanged[:20]}
     rep["checks"]["no_harvested_identity_in_output"] = leaks_total == 0
+    rep["checks"]["rewritten_outputs_readable"] = not bad_rewritten
+    rep["warnings"] = []
+    if bad_unchanged:
+        rep["warnings"].append(f"{len(bad_unchanged)} byte-identical output file(s) could not be parsed for the leak scan "
+                               f"and have no defect record - inspect leak_scan.unreadable_unchanged_unexplained_sample")
     rep["ok"] = all(rep["checks"].values())
     with open(os.path.join(private, "verify_report.json"), "w") as f:
         json.dump(rep, f, indent=1)
     return rep
+
+
+# ------------------------------------------------------------------------------------------
+# Pre-upload gate
+# ------------------------------------------------------------------------------------------
+GATE_TOP = {"corpus", "code", "README.txt"}
+PRIVATE_NAMES = {"salt.key", "identities.json", "path_map.tsv", "defects.tsv", "verify_report.json",
+                 "harvest_stats.json", "transform_stats.json"}
+
+
+def run_gate(private: str, corpus_dir: str, attempt_dir: str, expected_files: int | None = None,
+             max_objects: int = 400_000) -> tuple[bool, list, list]:
+    """Everything that must hold before attempt-N/ may be uploaded. Returns (ok, errors, notes)."""
+    errors: list = []
+    notes: list = []
+    rp = os.path.join(private, "verify_report.json")
+    rep = None
+    if not os.path.isfile(rp):
+        errors.append("verify_report.json is missing - run `python -m deid verify` first")
+    else:
+        with open(rp, encoding="utf-8") as f:
+            rep = json.load(f)
+        failed = sorted(k for k, v in rep.get("checks", {}).items() if not v)
+        if rep.get("ok") is not True or failed:
+            errors.append(f"verify_report.json is not ok (failed checks: {', '.join(failed) or 'unknown'})")
+        if expected_files is not None:
+            for k in ("inputs", "outputs", "mapped"):
+                if rep.get(k) != expected_files:
+                    errors.append(f"verify_report {k}={rep.get(k)} but {expected_files} files are expected")
+        if os.path.realpath(rep.get("output_dir", "")) != os.path.realpath(corpus_dir):
+            errors.append("verify_report.json was produced for a different output directory")
+        mp_ = os.path.join(private, "path_map.tsv")
+        if os.path.isfile(mp_) and os.path.getmtime(mp_) > os.path.getmtime(rp) + 1:
+            errors.append("path_map.tsv is newer than verify_report.json - transform ran after verify; re-run verify")
+        if rep.get("action_counts", {}).get("ERROR", 0):
+            errors.append(f"{rep['action_counts']['ERROR']} file(s) ended in ERROR")
+        notes.extend(rep.get("warnings", []))
+        ls = rep.get("leak_scan", {})
+        notes.append(f"known source defects that could not be scanned: {ls.get('unreadable_known_source_defects', 0)}")
+    n = 0
+    big = 0
+    for root, dirs, files in os.walk(corpus_dir):
+        for d in dirs:
+            if os.path.islink(os.path.join(root, d)):
+                errors.append(f"symlinked directory in corpus: {os.path.join(root, d)}")
+        for f in files:
+            fp = os.path.join(root, f)
+            if os.path.islink(fp):
+                errors.append(f"symlink in corpus (the uploader skips it): {fp}")
+                continue
+            if f.endswith(TMP_SUFFIX):
+                errors.append(f"leftover temp file in corpus: {fp}")
+            if os.path.getsize(fp) > (2 << 30):
+                big += 1
+            n += 1
+        if len(errors) > 50:
+            break
+    target = expected_files if expected_files is not None else (rep or {}).get("outputs")
+    if target is not None and n != target:
+        errors.append(f"corpus/ holds {n} files, expected {target}")
+    if n > max_objects:
+        errors.append(f"{n} corpus files exceed the {max_objects} object limit")
+    if big:
+        notes.append(f"{big} file(s) over 2 GB are skipped by the scorer")
+    try:
+        top = set(os.listdir(attempt_dir))
+    except OSError:
+        top = set()
+        errors.append(f"attempt directory {attempt_dir} not found")
+    if top:
+        for extra in sorted(top - GATE_TOP):
+            errors.append(f"unexpected entry in the attempt directory (only corpus/, code/, README.txt belong there): {extra}")
+        for need in sorted(GATE_TOP - top):
+            errors.append(f"attempt directory lacks {need}")
+    rd = os.path.join(attempt_dir, "README.txt")
+    if os.path.isfile(rd) and os.path.getsize(rd) == 0:
+        errors.append("README.txt is empty")
+    code = os.path.join(attempt_dir, "code")
+    if os.path.isdir(code):
+        if not os.path.isfile(os.path.join(code, "src", "deid", "__init__.py")):
+            errors.append("code/ does not contain the pipeline source (src/deid)")
+        for root, _dirs, files in os.walk(code):
+            for f in files:
+                if f in PRIVATE_NAMES or f.endswith((".tsv", ".token", ".env")) or f.startswith("salt"):
+                    errors.append(f"private-looking file inside code/: {os.path.join(root, f)}")
+    ap = os.path.realpath(attempt_dir) + os.sep
+    if (os.path.realpath(private) + os.sep).startswith(ap):
+        errors.append("the private directory lives inside the attempt directory")
+    notes.append(f"corpus files: {n}")
+    return (not errors), errors, notes
 
 
 # ------------------------------------------------------------------------------------------
@@ -389,7 +564,7 @@ WHAT THE PIPELINE DOES
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="deid", description="Machina CAD De-ID pipeline")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("harvest", "transform", "verify", "readme", "all"):
+    for name in ("harvest", "transform", "verify", "readme", "gate", "all"):
         p = sub.add_parser(name)
         p.add_argument("--input", default="input")
         p.add_argument("--output", default="out/corpus")
@@ -403,24 +578,35 @@ def main(argv=None) -> int:
         p.add_argument("--attempt", type=int, default=1)
         p.add_argument("--out", default="out/README.txt")
         p.add_argument("--notes", default="")
+        p.add_argument("--expected-files", type=int, default=None, help="exact number of input/output files (official: 188722)")
+        p.add_argument("--attempt-dir", default=None, help="attempt-N directory holding corpus/, code/, README.txt (gate)")
     a = ap.parse_args(argv)
+    verify_failed = False
     if a.cmd in ("harvest", "all"):
         run_harvest(a.input, a.private, a.jobs, deep=not a.no_deep_step)
     if a.cmd in ("transform", "all"):
         run_transform(a.input, a.output, a.private, a.jobs, link=not a.no_link,
                       rename_owners=not a.no_rename_owners, resume=a.resume, rename_paths=not a.no_rename_paths)
     if a.cmd in ("verify", "all"):
-        rep = run_verify(a.input, a.output, a.private, a.jobs)
+        rep = run_verify(a.input, a.output, a.private, a.jobs, expected_files=a.expected_files)
         print(json.dumps({k: v for k, v in rep.items() if k != "leak_scan"}, indent=1))
         print("leak_scan:", rep["leak_scan"])
         if not rep["ok"]:
             print("VERIFY FAILED", file=sys.stderr)
-            if a.cmd == "verify":
-                return 1
+            verify_failed = True
     if a.cmd in ("readme", "all"):
         write_readme(a.private, a.out, a.attempt, a.notes)
         print("wrote", a.out)
-    return 0
+    if a.cmd == "gate":
+        attempt_dir = a.attempt_dir or os.path.dirname(os.path.abspath(a.output.rstrip("/\\")))
+        ok, errors, notes = run_gate(a.private, a.output, attempt_dir, a.expected_files)
+        for n_ in notes:
+            print("note:", n_)
+        for e_ in errors:
+            print("GATE ERROR:", e_, file=sys.stderr)
+        print("GATE PASSED - safe to upload" if ok else "GATE FAILED - do not upload", file=sys.stderr if not ok else sys.stdout)
+        return 0 if ok else 1
+    return 1 if verify_failed else 0
 
 
 if __name__ == "__main__":

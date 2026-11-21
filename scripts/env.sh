@@ -5,6 +5,9 @@
 : "${WORK:=$PWD/work}"
 : "${ATTEMPT:=1}"
 export INPUT="$WORK/input"                       # official get-input.sh target
+# The official input has exactly this many files; verify and the upload gate refuse any other count.
+# Override only for small test corpora:  EXPECTED_FILES=20 bash scripts/20_run_pipeline.sh
+: "${EXPECTED_FILES:=188722}"; export EXPECTED_FILES
 export PRIVATE="$WORK/private"                   # salt, identity list, path map, defect log  (SECRET, never uploaded)
 export ATTEMPT_DIR="$WORK/attempt-$ATTEMPT"      # becomes gs://.../attempt-N/
 export OUT_CORPUS="$ATTEMPT_DIR/corpus"

@@ -8,7 +8,7 @@ its place in the tree and a valid internal structure, and there is exactly one o
 This repository is the code half of the submission. It contains no corpus, no source data, no secrets and no
 private mappings.
 
-**Status (2026-11-21):** the pipeline is implemented and passes its 44 unit and end-to-end tests on synthetic data
+**Status (2026-11-21):** the pipeline is implemented and passes its 55 unit and end-to-end tests on synthetic data
 (invented identities only). It has not yet been run on the full corpus, so there is no official score to report here.
 
 ## Design
@@ -51,6 +51,11 @@ MACHINA_UPLOAD_TOKEN=... DEST=gs://.../attempt-1/ bash scripts/40_upload.sh
 
 `python -m deid {harvest|transform|verify|readme|all}` accepts `--resume`, `--no-rename-paths` (content-only run),
 `--no-rename-owners`, `--no-link` and `--no-deep-step`.
+
+Safety gates: `verify` fails on a wrong file count (`EXPECTED_FILES`, default 188722), missing outputs, identity hits, or a
+rewritten output that cannot be parsed. `python -m deid gate` runs at the end of `20_run_pipeline.sh` and again inside
+`40_upload.sh`, which refuses to upload an attempt that has not passed it. `--resume` reprocesses any recorded file whose
+output is missing or has changed size.
 
 ## Security
 
