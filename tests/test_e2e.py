@@ -351,3 +351,160 @@ def test_gate_refuses_bad_attempt_layout_and_private_material(run, tmp_path):
     shutil.copytree(priv, inside)
     ok, errors, _ = P.run_gate(inside, corpus, att, 20)
     assert not ok and any("private directory lives inside the attempt directory" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- low-disk mode and disk guard
+def _fresh_input_and_private(run, tmp_path):
+    """A brand-new copy of the mini corpus plus the salt/identities of `run` (so outputs can be compared byte for byte)."""
+    import shutil
+    inp, priv = str(tmp_path / "input"), str(tmp_path / "pv")
+    shutil.copytree(run["inp"], inp)                                             # (fixture PDFs embed a build timestamp)
+    shutil.copytree(run["priv"], priv)
+    for f in ("path_map.tsv", "defects.tsv", "verify_report.json", "consumed.tsv"):
+        if os.path.exists(os.path.join(priv, f)):
+            os.unlink(os.path.join(priv, f))
+    return inp, priv
+
+
+def test_consume_input_deletes_only_rewritten_inputs_and_verify_still_passes(run, tmp_path):
+    inp, priv = _fresh_input_and_private(run, tmp_path)
+    out = str(tmp_path / "corpus")
+    P.run_transform(inp, out, priv, jobs=1, consume_input=True)
+    rows = _rows(priv)
+    rewritten = [r for r in rows if r[2] == "rewritten"]
+    unchanged = [r for r in rows if r[2] == "unchanged"]
+    assert rewritten and unchanged
+    for r in rewritten:
+        assert not os.path.exists(os.path.join(inp, r[0]))                       # input copy gone ...
+        assert os.path.isfile(os.path.join(out, r[1]))                           # ... the rewritten output is present
+    for r in unchanged:
+        assert os.path.samefile(os.path.join(inp, r[0]), os.path.join(out, r[1]))   # hard link: no extra bytes
+    assert {l.strip() for l in open(os.path.join(priv, "consumed.tsv"))} == {r[0] for r in rewritten}
+    rep = P.run_verify(inp, out, priv, jobs=1, expected_files=20)
+    assert rep["ok"], json.dumps(rep, indent=1)
+    assert rep["inputs"] == 20 and rep["inputs_consumed"] == len(rewritten)
+    for r in rows:                                                               # identical to the non-consuming run
+        assert open(os.path.join(out, r[1]), "rb").read() == open(os.path.join(run["out"], r[1]), "rb").read()
+
+
+def test_consume_input_needs_harvest_first(tmp_path):
+    inp = str(tmp_path / "in")
+    build_input(inp)
+    with pytest.raises(SystemExit):
+        P.run_transform(inp, str(tmp_path / "o"), str(tmp_path / "empty_private"), jobs=1, consume_input=True)
+
+
+def test_consume_input_crash_recovery_and_lost_output_is_detected(run, tmp_path):
+    import shutil
+    inp, priv = _fresh_input_and_private(run, tmp_path)
+    pristine = run["inp"]
+    out = str(tmp_path / "corpus")
+    P.run_transform(inp, out, priv, jobs=1, consume_input=True)
+    rows = _rows(priv)
+    rew = [r for r in rows if r[2] == "rewritten"]
+    # crash between 'row durable + intent logged' and 'unlink': the input is still there
+    shutil.copy(os.path.join(pristine, rew[0][0]), os.path.join(inp, rew[0][0]))
+    actions, _ = P.run_transform(inp, out, priv, jobs=1, resume=True, consume_input=True)
+    assert sum(actions.values()) == 0 and not os.path.exists(os.path.join(inp, rew[0][0]))
+    assert P.run_verify(inp, out, priv, jobs=1, expected_files=20)["ok"]
+    # an output lost AFTER its input was consumed cannot be rebuilt: resume says so and verify must fail
+    os.unlink(os.path.join(out, rew[1][1]))
+    P.run_transform(inp, out, priv, jobs=1, resume=True, consume_input=True)
+    rep = P.run_verify(inp, out, priv, jobs=1, expected_files=20)
+    assert rep["ok"] is False and rep["checks"]["every_input_mapped"] is False     # the row is gone, the input is gone: loud failure
+
+
+def test_disk_guard_unit(tmp_path, monkeypatch):
+    from deid import diskguard as D
+    D.check([str(tmp_path)], 0.0001)
+    with pytest.raises(D.DiskLow):
+        D.check([str(tmp_path)], 1e9)
+    D.check([str(tmp_path / "does-not-exist")], 1e9)                             # missing guard path is ignored
+    monkeypatch.setenv("DEID_GUARD_PATHS", f"{tmp_path}: ")
+    assert D.default_paths("/x") == ["/x", str(tmp_path)]
+
+
+def test_disk_guard_stops_cleanly_and_resume_finishes(run, tmp_path):
+    inp, priv = _fresh_input_and_private(run, tmp_path)
+    out = str(tmp_path / "corpus")
+    from deid import diskguard as D
+    with pytest.raises(D.DiskLow):
+        P.run_transform(inp, out, priv, jobs=1, min_free_gib=1e9, guard_every=1)
+    assert P.sweep_tmp(out) == 0                                                  # nothing half-written left behind
+    rows = _rows(priv)
+    assert 0 < len(rows) < 20 and all(os.path.isfile(os.path.join(out, r[1])) for r in rows)
+    P.run_transform(inp, out, priv, jobs=1, resume=True)                          # space is back: finish
+    assert P.run_verify(inp, out, priv, jobs=1, expected_files=20)["ok"]
+    for r in _rows(priv):
+        assert open(os.path.join(out, r[1]), "rb").read() == open(os.path.join(run["out"], r[1]), "rb").read()
+
+
+def test_cli_returns_3_when_disk_guard_trips(run, tmp_path):
+    inp, priv = _fresh_input_and_private(run, tmp_path)
+    args = ["transform", "--input", inp, "--output", str(tmp_path / "corpus"), "--private", priv, "--jobs", "1",
+            "--min-free-gb", "1000000000", "--guard-every", "1"]
+    assert P.main(args) == 3
+
+
+# --------------------------------------------------------------------------- status heartbeat
+def test_status_file_has_counts_and_no_identities(run, tmp_path):
+    out = tmp_path / "s" / "status.json"
+    log = tmp_path / "run.log"
+    log.write_text("line one\n[transform] 1000/188722 working\n")
+    rc = P.main(["status", "--private", run["priv"], "--status-file", str(out), "--stage", "TRANSFORM",
+                 "--msg", "hello", "--log", str(log), "--count-files", "--input", run["inp"], "--output", run["out"]])
+    assert rc == 0
+    d = json.load(open(out))
+    assert d["stage"] == "TRANSFORM" and d["path_map_rows"] == 20 and d["input_files_now"] >= 20
+    assert d["last_log_line"].startswith("[transform] 1000/188722") and d["free_gib_work"] > 0
+    blob = open(out).read().lower()
+    for secret in (fx.AUTHOR, fx.ORG, fx.EMAIL, fx.OWNER):
+        assert secret.lower() not in blob
+
+
+def test_status_peak_file_keeps_extremes(tmp_path):
+    from deid import status as S
+    pk = str(tmp_path / "peak.json")
+    S.update_peak(pk, {"time_utc": "t1", "free_gib_work": 100.0, "free_gib_host[/mnt/c]": 90.0, "used_gib_work": 10.0})
+    S.update_peak(pk, {"time_utc": "t2", "free_gib_work": 60.0, "free_gib_host[/mnt/c]": 95.0, "used_gib_work": 40.0})
+    d = S.update_peak(pk, {"time_utc": "t3", "free_gib_work": 80.0, "free_gib_host[/mnt/c]": None, "used_gib_work": 25.0})
+    assert d["min_free_gib_work"] == 60.0 and d["min_free_gib_host[/mnt/c]"] == 90.0
+    assert d["max_used_gib_work"] == 40.0 and d["samples"] == 3 and d["last_utc"] == "t3"
+
+
+def test_status_counts_skip_helper_dir(run, tmp_path):
+    out = tmp_path / "s.json"
+    assert P.main(["status", "--private", run["priv"], "--status-file", str(out), "--count-files",
+                   "--input", run["inp"], "--output", run["out"], "--peak-file", str(tmp_path / "peak.json")]) == 0
+    d = json.load(open(out))
+    assert d["input_files_now"] == 20 and d["output_files_now"] == 20
+    assert json.load(open(tmp_path / "peak.json"))["samples"] == 1
+
+
+def test_resume_never_reharvests_after_inputs_were_consumed(run, tmp_path):
+    import shutil
+    inp, priv = str(tmp_path / "input"), str(tmp_path / "private")
+    shutil.copytree(run["inp"], inp)
+    shutil.copytree(run["priv"], priv)
+    for n in ("path_map.tsv", "defects.tsv", "verify_report.json", "consumed.tsv"):
+        if os.path.exists(os.path.join(priv, n)):
+            os.remove(os.path.join(priv, n))
+    assert os.path.exists(os.path.join(priv, "harvest.done"))
+    before = open(os.path.join(priv, "identities.json"), "rb").read()
+    shutil.rmtree(os.path.join(inp, "sources", "github", "someone-else__proj"))     # inputs vanish (consumed)
+    assert P.main(["harvest", "--input", inp, "--private", priv, "--jobs", "2", "--resume"]) == 0
+    assert open(os.path.join(priv, "identities.json"), "rb").read() == before
+    os.remove(os.path.join(priv, "harvest.done"))                                    # without the marker it re-harvests
+    assert P.main(["harvest", "--input", inp, "--private", priv, "--jobs", "2", "--resume"]) == 0
+    assert open(os.path.join(priv, "harvest.done")).read().startswith("{")
+
+
+def test_summary_is_numbers_only(run, tmp_path):
+    out, summ = tmp_path / "s.json", tmp_path / "summary.json"
+    assert P.main(["status", "--private", run["priv"], "--status-file", str(out), "--summary-file", str(summ)]) == 0
+    d = json.load(open(summ))
+    assert d["verify_ok"] is True and d["inputs"] == 20 and d["outputs"] == 20 and d["warnings"] == 0
+    blob = open(summ).read().lower()
+    for secret in (fx.AUTHOR, fx.ORG, fx.EMAIL, fx.OWNER, "sample_files", run["inp"].lower()):
+        assert secret.lower() not in blob
+    assert all(isinstance(v, (int, float, bool)) for v in d["leak_scan"].values())

@@ -151,6 +151,15 @@ def test_pdf_metadata(ctx):
         assert str(pdf.docinfo["/Producer"]) == "SolidWorks PDF"
 
 
+def test_pdf_output_is_reproducible_across_time(ctx):
+    import time
+    src = fx.pdf_bytes()
+    a = rewrite_pdf(src, ctx)
+    time.sleep(1.1)                                   # qpdf's default /ID is time based; ours must not be
+    b = rewrite_pdf(src, ctx)
+    assert a == b
+
+
 def test_pdf_without_identity_is_untouched(ctx):
     src = fx.pdf_bytes(author="user")
     import pikepdf as pk

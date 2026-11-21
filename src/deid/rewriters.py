@@ -561,7 +561,7 @@ def rewrite_pdf(data: bytes, ctx: Ctx) -> bytes:
         if not changed:
             return data
         out = io.BytesIO()
-        pdf.save(out, linearize=False)
+        pdf.save(out, linearize=False, deterministic_id=True)   # reproducible: no time-based /ID
         return out.getvalue()
     finally:
         pdf.close()

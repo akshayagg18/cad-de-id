@@ -10,6 +10,8 @@ import os
 import sys
 import time
 
+from . import diskguard
+from . import status as status_mod
 from . import harvest as H
 from .identity import IdentityStore, Replacer, load_or_create_salt
 from .rewriters import Ctx, TMP_SUFFIX, classify, process_blob, process_file, _ext
@@ -80,6 +82,8 @@ def run_harvest(input_dir: str, private: str, jobs: int, deep: bool = True, file
                 print(f"[harvest] {i}/{len(rels)} files, {len(store.phrases)} phrases, {time.time()-t0:.0f}s", flush=True)
     store.finalize()
     store.save(os.path.join(private, "identities.json"))
+    with open(os.path.join(private, "harvest.done"), "w") as f:      # written last: "identities.json is complete"
+        json.dump({"files": len(rels), "phrases": len(store.phrases)}, f)
     with open(os.path.join(private, "harvest_stats.json"), "w") as f:
         json.dump({"wall_seconds": round(time.time() - t0, 1), "files": len(rels),
                    "per_ext": {k: v for k, v in sorted(per_ext.items(), key=lambda kv: -kv[1][2])}}, f, indent=1)
@@ -136,7 +140,7 @@ def sweep_tmp(output_dir):
     return n
 
 
-def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) -> tuple[set, int]:
+def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) -> tuple[set, int, list]:
     """Decide which recorded rows can be trusted on --resume.
 
     A row counts as done only if its output file still exists (and, for byte-identical files, still has the
@@ -146,6 +150,7 @@ def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) 
     """
     kept: list[str] = []
     done: set = set()
+    rewritten: list = []
     dropped_outs: set = set()
     dropped = 0
     with open(map_path, encoding="utf-8") as f:
@@ -165,6 +170,8 @@ def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) 
             if ok:
                 kept.append(line if line.endswith("\n") else line + "\n")
                 done.add(rel)
+                if action == "rewritten":
+                    rewritten.append(rel)
             else:
                 dropped += 1
                 dropped_outs.add(rel_out)
@@ -185,38 +192,107 @@ def _resume_state(map_path: str, defects_path: str, output_dir: str, rels: set) 
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(keep_d)
         os.replace(tmp, defects_path)
-    return done, dropped
+    return done, dropped, rewritten
 
 
-def run_transform(input_dir, output_dir, private, jobs, link=True, rename_owners=True, resume=False, rename_paths=True):
+def _load_consumed(private: str) -> set:
+    p = os.path.join(private, "consumed.tsv")
+    if not os.path.exists(p):
+        return set()
+    with open(p, encoding="utf-8") as f:
+        return {l.rstrip("\n") for l in f if l.strip()}
+
+
+def _consume(files, pending: list, input_dir: str, conf) -> None:
+    """Delete the input copy of files that were rewritten. Order matters for crash safety: the path_map rows are made
+    durable first, the intent is logged to consumed.tsv and made durable, only then are the inputs unlinked."""
+    if not pending:
+        return
+    for f in files:
+        f.flush()
+        os.fsync(f.fileno())
+    for rel in pending:
+        conf.write(rel + "\n")
+    conf.flush()
+    os.fsync(conf.fileno())
+    for rel in pending:
+        try:
+            os.unlink(os.path.join(input_dir, rel))
+        except FileNotFoundError:
+            pass
+    pending.clear()
+
+
+def run_transform(input_dir, output_dir, private, jobs, link=True, rename_owners=True, resume=False, rename_paths=True,
+                  consume_input=False, min_free_gib=0.0, guard_paths=None, guard_every=100):
+    """Write one output per input.
+
+    consume_input: low-disk mode. As soon as a file has been REWRITTEN (and its path_map row is durable) the input copy
+        is deleted, so the disk never holds both versions. Byte-identical files are hard links and cost nothing extra.
+        The original corpus then has to be downloaded again for another attempt. Needs phase 1 (harvest) to be done.
+    min_free_gib: raise diskguard.DiskLow (after a clean stop) when a guarded filesystem drops below this.
+    """
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(private, exist_ok=True)
+    if consume_input and not os.path.exists(os.path.join(private, "identities.json")):
+        raise SystemExit("--consume-input needs phase 1 first: run `python -m deid harvest` (identities.json missing)")
     rels = walk_inputs(input_dir)
     done = set()
     map_path = os.path.join(private, "path_map.tsv")
     defects_path = os.path.join(private, "defects.tsv")
+    consumed_path = os.path.join(private, "consumed.tsv")
+    consumed = _load_consumed(private) if resume else set()
+    if not resume and os.path.exists(consumed_path):
+        os.unlink(consumed_path)                                    # a fresh run starts from a complete input
     if resume and os.path.exists(map_path):
-        done, dropped = _resume_state(map_path, defects_path, output_dir, set(rels))
+        done, dropped, rewritten_done = _resume_state(map_path, defects_path, output_dir, set(rels) | consumed)
         if dropped:
             print(f"[transform] resume: {dropped} recorded rows had a missing/changed output or failed earlier "
                   f"and will be processed again", flush=True)
+        lost = [r for r in consumed if r not in done and not os.path.exists(os.path.join(input_dir, r))]
+        if lost:
+            print(f"[transform] WARNING: {len(lost)} consumed input(s) have no valid output any more and cannot be redone "
+                  f"without downloading the corpus again (first: {lost[0]})", flush=True)
+        if consume_input:                                           # finish deletions interrupted by a crash
+            leftovers = [r for r in rewritten_done if os.path.exists(os.path.join(input_dir, r))]
+            with open(consumed_path, "a", encoding="utf-8") as conf:
+                _consume([], leftovers, input_dir, conf)
     todo = [r for r in rels if r not in done]
-    print(f"[transform] {len(rels)} inputs, {len(done)} already done, {len(todo)} to do", flush=True)
+    print(f"[transform] {len(rels)} inputs, {len(done)} already done, {len(todo)} to do"
+          f"{' (consume-input: ON)' if consume_input else ''}", flush=True)
     stats = collections.Counter()
     actions = collections.Counter()
     t0 = time.time()
     mode = "a" if resume else "w"               # a fresh run must never inherit rows from an earlier run
-    with open(map_path, mode, encoding="utf-8") as mapf, open(os.path.join(private, "defects.tsv"), mode, encoding="utf-8") as deff, \
-            mp.Pool(jobs, initializer=_t_init, initargs=(input_dir, output_dir, private, link, rename_owners, rename_paths)) as pool:
-        for i, (rel, rel_out, action, size, defects, delta) in enumerate(pool.imap_unordered(_t_one, todo, chunksize=8), 1):
-            mapf.write(f"{rel}\t{rel_out}\t{action}\t{size}\n")
-            for where, why in defects:
-                deff.write(f"{where}\t{why}\n")
-            actions[action] += 1
-            stats.update(delta)
-            if i % 2000 == 0:
-                mapf.flush(); deff.flush()
-                print(f"[transform] {i}/{len(todo)} {dict(actions)} {time.time()-t0:.0f}s", flush=True)
+    guard = guard_paths if guard_paths is not None else diskguard.default_paths(output_dir)
+    pending: list = []
+    try:
+        with open(map_path, mode, encoding="utf-8") as mapf, open(defects_path, mode, encoding="utf-8") as deff, \
+                open(consumed_path, "a", encoding="utf-8") as conf, \
+                mp.Pool(jobs, initializer=_t_init, initargs=(input_dir, output_dir, private, link, rename_owners, rename_paths)) as pool:
+            for i, (rel, rel_out, action, size, defects, delta) in enumerate(pool.imap_unordered(_t_one, todo, chunksize=8), 1):
+                mapf.write(f"{rel}\t{rel_out}\t{action}\t{size}\n")
+                for where, why in defects:
+                    deff.write(f"{where}\t{why}\n")
+                actions[action] += 1
+                stats.update(delta)
+                if consume_input and action == "rewritten":
+                    pending.append(rel)
+                if i % guard_every == 0:
+                    if consume_input:
+                        _consume([mapf, deff], pending, input_dir, conf)
+                    if min_free_gib > 0:
+                        diskguard.check(guard, min_free_gib)        # raises DiskLow; the with-block terminates the pool
+                if i % 2000 == 0:
+                    mapf.flush(); deff.flush()
+                    print(f"[transform] {i}/{len(todo)} {dict(actions)} {time.time()-t0:.0f}s", flush=True)
+            if consume_input:
+                _consume([mapf, deff], pending, input_dir, conf)
+    except diskguard.DiskLow as e:
+        swept = sweep_tmp(output_dir)
+        print(f"[transform] STOPPED SAFELY: {e}. {sum(actions.values())} files finished in this run, {swept} partial temp "
+              f"file(s) removed. Free some space and run again with --resume.", flush=True)
+        raise
     swept = sweep_tmp(output_dir)
     if swept:
         print(f"[transform] removed {swept} stale temp files", flush=True)
@@ -317,7 +393,8 @@ def _v_one(args):
 def run_verify(input_dir, output_dir, private, jobs, expected_files: int | None = None) -> dict:
     rep: dict = {"checks": {}, "output_dir": os.path.realpath(output_dir),
                  "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    ins = set(walk_inputs(input_dir))
+    consumed = _load_consumed(private)                 # inputs deleted by --consume-input still count as inputs
+    ins = set(walk_inputs(input_dir)) | consumed
     outs = set(walk_inputs(output_dir))
     rows = []
     with open(os.path.join(private, "path_map.tsv"), encoding="utf-8") as f:
@@ -327,6 +404,7 @@ def run_verify(input_dir, output_dir, private, jobs, expected_files: int | None 
     mapped_in = {r[0] for r in rows}
     out_names = [r[1] for r in rows]
     rep["inputs"], rep["outputs"], rep["mapped"] = len(ins), len(outs), len(mapped_in)
+    rep["inputs_consumed"] = len(consumed)
     if expected_files is not None:
         rep["expected_files"] = expected_files
         rep["checks"]["input_count_is_expected"] = len(ins) == expected_files
@@ -564,7 +642,7 @@ WHAT THE PIPELINE DOES
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="deid", description="Machina CAD De-ID pipeline")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("harvest", "transform", "verify", "readme", "gate", "all"):
+    for name in ("harvest", "transform", "verify", "readme", "gate", "status", "all"):
         p = sub.add_parser(name)
         p.add_argument("--input", default="input")
         p.add_argument("--output", default="out/corpus")
@@ -578,15 +656,37 @@ def main(argv=None) -> int:
         p.add_argument("--attempt", type=int, default=1)
         p.add_argument("--out", default="out/README.txt")
         p.add_argument("--notes", default="")
+        p.add_argument("--consume-input", action="store_true",
+                       help="low-disk mode: delete each input file right after its rewritten output is durable (needs a re-download for another attempt)")
+        p.add_argument("--stage", default="", help="status: current stage name")
+        p.add_argument("--msg", default="", help="status: short message")
+        p.add_argument("--log", default=None, help="status: log file whose last line is reported")
+        p.add_argument("--status-file", default=None, help="status: JSON file to write")
+        p.add_argument("--summary-file", default=None, help="status: also write the numbers-only run digest here")
+        p.add_argument("--peak-file", default=None, help="status: JSON file that keeps the lowest free / highest used space seen")
+        p.add_argument("--count-files", action="store_true", help="status: also count files in --input/--output (slow on 188k files)")
+        p.add_argument("--guard-every", type=int, default=100, help="check free space after every N finished files")
+        p.add_argument("--min-free-gb", type=float, default=0.0,
+                       help="stop safely (resumable) when output filesystem or any DEID_GUARD_PATHS drive has less free space (GiB)")
         p.add_argument("--expected-files", type=int, default=None, help="exact number of input/output files (official: 188722)")
         p.add_argument("--attempt-dir", default=None, help="attempt-N directory holding corpus/, code/, README.txt (gate)")
     a = ap.parse_args(argv)
     verify_failed = False
     if a.cmd in ("harvest", "all"):
-        run_harvest(a.input, a.private, a.jobs, deep=not a.no_deep_step)
+        if a.resume and os.path.exists(os.path.join(a.private, "harvest.done")) \
+                and os.path.exists(os.path.join(a.private, "identities.json")):
+            # Never re-harvest on resume: with --consume-input some inputs are gone, and a second harvest would
+            # build a different identity registry than the files already written were pseudonymized with.
+            print("[harvest] already complete (harvest.done) - keeping the existing identities.json", flush=True)
+        else:
+            run_harvest(a.input, a.private, a.jobs, deep=not a.no_deep_step)
     if a.cmd in ("transform", "all"):
-        run_transform(a.input, a.output, a.private, a.jobs, link=not a.no_link,
-                      rename_owners=not a.no_rename_owners, resume=a.resume, rename_paths=not a.no_rename_paths)
+        try:
+            run_transform(a.input, a.output, a.private, a.jobs, link=not a.no_link,
+                          rename_owners=not a.no_rename_owners, resume=a.resume, rename_paths=not a.no_rename_paths,
+                          consume_input=a.consume_input, min_free_gib=a.min_free_gb, guard_every=a.guard_every)
+        except diskguard.DiskLow:
+            return 3
     if a.cmd in ("verify", "all"):
         rep = run_verify(a.input, a.output, a.private, a.jobs, expected_files=a.expected_files)
         print(json.dumps({k: v for k, v in rep.items() if k != "leak_scan"}, indent=1))
@@ -597,6 +697,20 @@ def main(argv=None) -> int:
     if a.cmd in ("readme", "all"):
         write_readme(a.private, a.out, a.attempt, a.notes)
         print("wrote", a.out)
+    if a.cmd == "status":
+        if not a.status_file:
+            print("--status-file is required", file=sys.stderr)
+            return 2
+        d = status_mod.collect(a.stage, a.msg, a.private, work=os.path.dirname(os.path.abspath(a.private)),
+                               guard_paths=[p for p in os.environ.get("DEID_GUARD_PATHS", "").split(":") if p.strip()],
+                               log=a.log, input_dir=a.input if a.count_files else None,
+                               output_dir=a.output if a.count_files else None)
+        status_mod.write(a.status_file, d)
+        if a.peak_file:
+            status_mod.update_peak(a.peak_file, d)
+        if a.summary_file:
+            status_mod.write(a.summary_file, status_mod.summarize(a.private))
+        return 0
     if a.cmd == "gate":
         attempt_dir = a.attempt_dir or os.path.dirname(os.path.abspath(a.output.rstrip("/\\")))
         ok, errors, notes = run_gate(a.private, a.output, attempt_dir, a.expected_files)

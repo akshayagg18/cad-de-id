@@ -13,8 +13,8 @@ import olefile, pikepdf
 print("python", sys.version.split()[0], "olefile", olefile.__version__, "pikepdf", pikepdf.__version__)
 PY
 avail_gb=$(df -P --block-size=1G "$WORK" | awk 'NR==2{print $4}')
-echo "free space on WORK filesystem: ${avail_gb} GB (need >= ~150 GB for input + >= ~60 GB for rewritten output)"
-[ "${avail_gb:-0}" -ge 210 ] || { echo "WARN: less than ~210 GB free"; }
+echo "free space on WORK filesystem: ${avail_gb} GB (CONSUME=1: ~150 GB peak; CONSUME=0: ~190-260 GB)"
+[ "${avail_gb:-0}" -ge 175 ] || { echo "WARN: less than ~175 GB free - only a sample run is safe"; }
 t="$WORK/.case_test"; mkdir -p "$t"; : > "$t/a"; : > "$t/A"
 [ "$(ls "$t" | wc -l)" = 2 ] && echo "case-sensitive FS: yes" || { echo "FAIL: case-insensitive filesystem"; fail=1; }
 ln "$t/a" "$t/hl" 2>/dev/null && echo "hard links: yes" || echo "WARN: no hard links -> run transform with --no-link (needs a full second copy of the unchanged files)"
